@@ -2,10 +2,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <algorithm>
+#include "Checksum.h"
 
 // if params are incorrect
 static void Usage() {
-    printf("Must be in Usage format: hw3p1.exe <host> <power> <senderWindow> <RTT> <lossFwd> <lossRet> <speedMbps>\n");
+    printf("Must be in Usage format: hw3p2.exe <host> <power> <senderWindow> <RTT> <lossFwd> <lossRet> <speedMbps>\n");
 }
 
 int main(int argc, char** argv) {
@@ -56,6 +57,10 @@ int main(int argc, char** argv) {
     int initMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tInit).count();
     printf("done in %d ms\n", initMs);
 
+    Checksum cs;
+    UINT64 byteBufferSize = dwordBufSize << 2;
+    DWORD myChecksum = cs.CRC32((unsigned char*)dwordBuf, (size_t)byteBufferSize);
+
     // connect
     SenderSocket ss;
     int status;
@@ -67,11 +72,10 @@ int main(int argc, char** argv) {
         return -1;
     }
     auto tConnected = std::chrono::steady_clock::now();
-    printf("Main:\tconnected to %s in %.3f sec, pkt size %d bytes\n", targetHost, std::chrono::duration<double>(tConnected - tOpen).count(), MAX_PKT_SIZE);
+    printf("Main:\tconnected to %s in %.3f sec, pkt %d bytes\n", targetHost, std::chrono::duration<double>(tConnected - tOpen).count(), MAX_PKT_SIZE);
 
     // transfer
     char* charBuf = (char*)dwordBuf;
-    UINT64 byteBufferSize = dwordBufSize << 2;
     UINT64 off = 0;
 
     while (off < byteBufferSize) {
@@ -86,16 +90,22 @@ int main(int argc, char** argv) {
     }
 
     // transfer time = returning from Open() - calling Close()
-    double transferTime = std::chrono::duration<double>(std::chrono::steady_clock::now() - tConnected).count();
-
-    if ((status = ss.Close()) != STATUS_OK) {
+    double transferTime = 0;
+    if ((status = ss.Close(&transferTime)) != STATUS_OK) {
         printf("Main:\tclose failed with status %d\n", status);
         delete[] dwordBuf;
         WSACleanup();
         return -1;
     }
 
-    printf("Main:\ttransfer finished in %.3f sec\n", transferTime);
+    double rateKbps = (transferTime > 0) ? ((byteBufferSize * 8.0) / (transferTime * 1000.0)) : 0.0;
+    printf("Main:\ttransfer finished in %.3f sec, %.2f Kbps, checksum %X\n",
+        transferTime, rateKbps, ss.GetFinalChecksum());
+
+    // ideal rate
+    int payloadBits = (MAX_PKT_SIZE - sizeof(SenderDataHeader)) * 8;
+    double idealRateKbps = (ss.GetEstRTT() > 0) ? ((double)ss.GetEffectiveWindow() * payloadBits) / (ss.GetEstRTT() * 1000.0) : 0.0;
+    printf("Main:\testRTT %.3f, ideal rate %.2f Kbps\n", ss.GetEstRTT(), idealRateKbps);
 
     // clean up
     delete[] dwordBuf;

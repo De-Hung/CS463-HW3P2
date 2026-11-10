@@ -243,36 +243,36 @@ int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int 
             int ready = select(0, &fd, NULL, NULL, &tv);
             if (ready == SOCKET_ERROR) return FAILED_RECV;
             if (ready == 0) {
-                numTimeouts++;
                 break;
-            }
 
-            struct sockaddr_in from;
-            int fromLen = sizeof(from);
-            int bytes = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
+                struct sockaddr_in from;
+                int fromLen = sizeof(from);
+                int bytes = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
 
-            if (bytes == SOCKET_ERROR) return FAILED_RECV;
-            if (bytes != sizeof(ReceiverHeader)) continue;
-            if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
-            if (isSYN) {
-                if (rh.flags.SYN) {
-                    rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
-                    return STATUS_OK;
-                }
-            } else if (isFIN) {
-                if (rh.flags.FIN) return STATUS_OK;
-            } else {
-                // ACK checks for seq + 1
-                if (rh.ackSeq == seq + 1) {
-                    // only update RTO on attempt 1
-                    if (attempt == 1) {
+                if (bytes == SOCKET_ERROR) return FAILED_RECV;
+                if (bytes != sizeof(ReceiverHeader)) continue;
+                if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
+                if (isSYN) {
+                    if (rh.flags.SYN) {
                         rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
-                        UpdateRTO(rttSample);
+                        return STATUS_OK;
                     }
-                    return STATUS_OK;
+                } else if (isFIN) {
+                    if (rh.flags.FIN) return STATUS_OK;
+                } else {
+                    // ACK checks for seq + 1
+                    if (rh.ackSeq == seq + 1) {
+                        // only update RTO on attempt 1
+                        if (attempt == 1) {
+                            rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
+                            UpdateRTO(rttSample);
+                        }
+                        return STATUS_OK;
+                    }
                 }
             }
+            numTimeouts++;
         }
+        return TIMEOUT;
     }
-    return TIMEOUT;
 }

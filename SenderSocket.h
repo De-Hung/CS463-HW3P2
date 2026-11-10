@@ -13,7 +13,7 @@
 // max UDP packet size
 #define MAX_PKT_SIZE (1500 - 28)
 
-// possible status codes from ss.Open, ss.Send, ss.Close
+// possible status codes
 #define STATUS_OK          0   // no error
 #define ALREADY_CONNECTED  1   // second call to ss.Open() without closing connection
 #define NOT_CONNECTED      2   // call to ss.Send()/Close() without ss.Open()
