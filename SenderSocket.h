@@ -4,6 +4,8 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <chrono>
+#include <thread>
+#include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -64,8 +66,8 @@ public:
 class ReceiverHeader {
 public:
     Flags flags;
-    DWORD recvWnd;        // receiver window for flow control (in pkts)
-    DWORD ackSeq;         // ack value = next expected sequence
+    DWORD recvWnd;
+    DWORD ackSeq;
 };
 
 #pragma pack(pop)
@@ -76,19 +78,44 @@ public:
     ~SenderSocket();
 
     int Open(const char* targetHost, int port, int senderWindow, LinkProperties* lp);
-    int Send(const char* buf, int bytes);   // stub in Part 1
-    int Close();
+    int Send(const char* buf, int bytes);
+    int Close(double* elapsedTime);
+
+    double GetEstRTT() const { return estRTT; }
+    DWORD GetFinalChecksum() const { return finalChecksum; }
+    int GetEffectiveWindow() const { return effWnd; }
 
 private:
     // sends pkt, waits up to RTO for a reply with expected flags
     // success fills rh and rtt
-    int SendAndWait(const char* name, DWORD seq, const char* pkt, int len, int maxAttempts, bool printIP, bool wantSYN, bool wantFIN, ReceiverHeader& rh, double& rtt);
-    double Now() const;   // seconds since constructor
+    int SendAndWait(const char* name, DWORD seq, const char* pkt, int len, int maxAttempts, bool isSYN, bool isFIN, ReceiverHeader& rh, double& rttSample);
+    void UpdateRTO(double sampleRTT);
+    double Now() const;
+
+    static DWORD WINAPI StatsThreadEntry(LPVOID param);
+    void StatsWorker();
 
     SOCKET sock;
     struct sockaddr_in server;
     bool connected;
+
+    double estRTT;
+    double devRTT;
     double RTO;
-    DWORD nextSeq;
+
+    std::atomic<DWORD> baseSeq;     // B: base sequence number
+    std::atomic<DWORD> nextSeq;     // N: next sequence number to send
+    std::atomic<int> numTimeouts;   // T: timeout count
+    std::atomic<int> numFastRetx;   // F: fast transmit count
+
+    int senderWnd;
+    int effWnd;
+    DWORD finalChecksum;
+    
     std::chrono::steady_clock::time_point t0;
+    std::chrono::steady_clock::time_point tFirstData;
+    std::chrono::steady_clock::time_point tLastData;
+
+    HANDLE hStatsThread;
+    HANDLE hStopEvent;
 };
