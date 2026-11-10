@@ -79,6 +79,7 @@ void SenderSocket::StatsWorker() {
 
 int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkProperties* lp) {
     if (connected) return ALREADY_CONNECTED;
+    senderWnd = senderWindow;
 
     // builds destination address
     memset(&server, 0, sizeof(server));
@@ -89,10 +90,7 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     DWORD ip = inet_addr(targetHost);
     if (ip == INADDR_NONE) {
         struct hostent* remote = gethostbyname(targetHost);
-        if (remote == NULL) {
-            printf("[%6.3f]\t--> target %s is invalid\n", Now(), targetHost);
-            return INVALID_NAME;
-        }
+        if (remote == NULL) return INVALID_NAME;
         memcpy(&server.sin_addr, remote->h_addr, remote->h_length);
     } else {
         server.sin_addr.S_un.S_addr = ip;
@@ -100,10 +98,7 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
 
     // create and bind UDP socket to port 0
     sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        printf("[%6.3f]\t--> failed socket with %d\n", Now(), WSAGetLastError());
-        return FAILED_SEND;
-    }
+    if (sock == INVALID_SOCKET) return FAILED_SEND;
 
     struct sockaddr_in local;
     memset(&local, 0, sizeof(local));
@@ -112,13 +107,14 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     local.sin_port = htons(0);
 
     if (bind(sock, (struct sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
-        printf("[%6.3f]\t--> failed bind with %d\n", Now(), WSAGetLastError());
         closesocket(sock);
         sock = INVALID_SOCKET;
         return FAILED_SEND;
     }
 
     // SYN
+    RTO = max(1.0, 2.0 * (double)lp->RTT);
+
     // router buffer
     lp->bufferSize = senderWindow + OTHER_MAX_ATTEMPTS;
     SenderSynHeader ssh;
@@ -127,67 +123,115 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
     ssh.lp = *lp;
 
     ReceiverHeader rh;
-    double rtt = 0;
-    int status = SendAndWait("SYN", 0, (const char*)&ssh, sizeof(ssh), SYN_MAX_ATTEMPTS, true, true, false, rh, rtt);
+    double rttSample = 0;
+    int status = SendAndWait("SYN", 0, (const char*)&ssh, sizeof(ssh), SYN_MAX_ATTEMPTS, true, false, rh, rttSample);
     if (status != STATUS_OK) {
         closesocket(sock);
         sock = INVALID_SOCKET;
         return status;
     }
 
-    // SYN-ACK
-    RTO = 3.0 * rtt;
-    printf("[%6.3f]\t<-- SYN-ACK %d window %d; setting initial RTO to %.3f\n", Now(), rh.ackSeq, rh.recvWnd, RTO);
+    // estimators from SYN sample RTT
+    estRTT = rttSample;
+    devRTT = 0.0;
+    RTO = estRTT + 4.0 * max(devRTT, 0.010);
+    effWnd = min(senderWnd, (int)rh.recvWnd);
 
+    baseSeq = 0;
     nextSeq = 0;
+    numTimeouts = 0;
+    numFastRetx = 0;
     connected = true;
+
+    // starts 2-sec stats worker thread
+    hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    hStatsThread = CreateThread(NULL, 0, StatsThreadEntry, this, 0, NULL);
+
     return STATUS_OK;
 }
 
 int SenderSocket::Send(const char* buf, int bytes) {
-    // Placeholder for main
     if (!connected) return NOT_CONNECTED;
+
+    char pkt[MAX_PKT_SIZE];
+    SenderDataHeader* sdh = (SenderDataHeader*)pkt;
+    sdh->flags.magic = MAGIC_PROTOCOL;
+    sdh->flags.SYN = 0;
+    sdh->flags.ACK = 0;
+    sdh->flags.FIN = 0;
+    sdh->seq = nextSeq.load();
+
+    memcpy(pkt + sizeof(SenderDataHeader), buf, bytes);
+    int pktLen = (int)(sizeof(SenderDataHeader) + bytes);
+
+    if (sdh->seq == 0) tFirstData = std::chrono::steady_clock::now();
+    nextSeq++;
+
+    // same as Open()
+    ReceiverHeader rh;
+    double rttSample = 0;
+    int status = SendAndWait("data", sdh->seq, pkt, pktLen, OTHER_MAX_ATTEMPTS, false, false, rh, rttSample);
+    if (status != STATUS_OK) return status;
+
+    effWnd = min(senderWnd, (int)rh.recvWnd);
+    baseSeq = rh.ackSeq;
+    tLastData = std::chrono::steady_clock::now();
+
     return STATUS_OK;
 }
 
-int SenderSocket::Close() {
+int SenderSocket::Close(double* elapsedTime) {
     if (!connected) return NOT_CONNECTED;
+    if (hStopEvent != NULL) {
+        SetEvent(hStopEvent);
 
+        if (hStatsThread != NULL) {
+            WaitForSingleObject(hStatsThread, INFINITE);
+            CloseHandle(hStatsThread);
+            hStatsThread = NULL;
+        }
+
+        CloseHandle(hStopEvent);
+        hStopEvent = NULL;
+    }
+
+    DWORD finSeq = nextSeq.load();
     SenderDataHeader sdh;
+    sdh.flags.magic = MAGIC_PROTOCOL;
     sdh.flags.FIN = 1;
-    sdh.seq = nextSeq;
+    sdh.seq = finSeq;
 
     ReceiverHeader rh;
-    double rtt = 0;
-    int status = SendAndWait("FIN", nextSeq, (const char*)&sdh, sizeof(sdh), OTHER_MAX_ATTEMPTS, false, false, true, rh, rtt);
+    double rttSample = 0;
+    int status = SendAndWait("FIN", finSeq, (const char*)&sdh, sizeof(sdh), OTHER_MAX_ATTEMPTS, false, true, rh, rttSample);
     if (status != STATUS_OK) return status;
 
-    printf("[%6.3f]\t<-- FIN-ACK %d window %d\n", Now(), rh.ackSeq, rh.recvWnd);
+    finalChecksum = rh.recvWnd;
+    printf("[%6.2f] <-- FIN-ACK %d window %X\n", Now(), rh.ackSeq, finalChecksum);
+
+    if (elapsedTime != nullptr) *elapsedTime = std::chrono::duration<double>(tLastData - tFirstData).count();
+
     connected = false;
     closesocket(sock);
     sock = INVALID_SOCKET;
     return STATUS_OK;
 }
 
-int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int len, int maxAttempts, bool printIP, bool wantSYN, bool wantFIN, ReceiverHeader& rh, double& rtt) {
+int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int len, int maxAttempts, bool isSYN, bool isFIN, ReceiverHeader& rh, double& rttSample) {
     // records when attempt was sent
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-        double sendTime = Now();
+        auto sendTime = std::chrono::steady_clock::now();
+        if (sendto(sock, pkt, len, 0, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) return FAILED_SEND;
 
-        if (printIP) printf("[%6.3f]\t--> %s %d (attempt %d of %d, RTO %.3f) to %s\n", sendTime, name, seq, attempt, maxAttempts, RTO, inet_ntoa(server.sin_addr));
-        else printf("[%6.3f]\t--> %s %d (attempt %d of %d, RTO %.3f)\n", sendTime, name, seq, attempt, maxAttempts, RTO);
-
-        if (sendto(sock, pkt, len, 0, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
-            printf("[%6.3f]\t--> failed sendto with %d\n", Now(), WSAGetLastError());
-            return FAILED_SEND;
-        }
-
-        double deadline = sendTime + RTO;
+        double deadline = Now() + RTO;
 
         // wait for a matching reply until RTO expires
         while (true) {
             double remaining = deadline - Now();
-            if (remaining <= 0) break;
+            if (remaining <= 0) {
+                numTimeouts++;
+                break;
+            }
 
             fd_set fd;
             FD_ZERO(&fd);
@@ -197,26 +241,37 @@ int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int 
             tv.tv_usec = (long)((remaining - tv.tv_sec) * 1e6);
 
             int ready = select(0, &fd, NULL, NULL, &tv);
-            if (ready == SOCKET_ERROR) {
-                printf("[%6.3f]\t<-- failed recvfrom with %d\n", Now(), WSAGetLastError());
-                return FAILED_RECV;
+            if (ready == SOCKET_ERROR) return FAILED_RECV;
+            if (ready == 0) {
+                numTimeouts++;
+                break;
             }
-            if (ready == 0) break;
 
             struct sockaddr_in from;
             int fromLen = sizeof(from);
             int bytes = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
 
-            if (bytes == SOCKET_ERROR) {
-                printf("[%6.3f]\t<-- failed recvfrom with %d\n", Now(), WSAGetLastError());
-                return FAILED_RECV;
-            }
+            if (bytes == SOCKET_ERROR) return FAILED_RECV;
             if (bytes != sizeof(ReceiverHeader)) continue;
-            if (rh.flags.ACK && ((wantSYN && rh.flags.SYN) || (wantFIN && rh.flags.FIN))) {
-                rtt = Now() - sendTime;
-                return STATUS_OK;
+            if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
+            if (isSYN) {
+                if (rh.flags.SYN) {
+                    rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
+                    return STATUS_OK;
+                }
+            } else if (isFIN) {
+                if (rh.flags.FIN) return STATUS_OK;
+            } else {
+                // ACK checks for seq + 1
+                if (rh.ackSeq == seq + 1) {
+                    // only update RTO on attempt 1
+                    if (attempt == 1) {
+                        rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
+                        UpdateRTO(rttSample);
+                    }
+                    return STATUS_OK;
+                }
             }
-            // otherwise ignore and keep waiting out RTO
         }
     }
     return TIMEOUT;
