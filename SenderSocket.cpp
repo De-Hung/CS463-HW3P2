@@ -1,20 +1,80 @@
 #include "SenderSocket.h"
 #include <stdio.h>
+#include <algorithm>
 
 // initialize socket
-SenderSocket::SenderSocket() : sock(INVALID_SOCKET), connected(false), RTO(DEFAULT_RTO), nextSeq(0) {
+SenderSocket::SenderSocket() : sock(INVALID_SOCKET), connected(false), estRTT(0.0), devRTT(0.0), RTO(DEFAULT_RTO), baseSeq(0), nextSeq(0), numTimeouts(0), numFastRetx(0), senderWnd(1), effWnd(1), finalChecksum(0), hStatsThread(NULL), hStopEvent(NULL) {
     memset(&server, 0, sizeof(server));
     t0 = std::chrono::steady_clock::now();
 }
 
 SenderSocket::~SenderSocket() {
-    if (sock != INVALID_SOCKET)
+    if (hStopEvent != NULL) {
+        SetEvent(hStopEvent);
+
+        if (hStatsThread != NULL) {
+            WaitForSingleObject(hStatsThread, INFINITE);
+            CloseHandle(hStatsThread);
+            hStatsThread = NULL;
+        }
+
+        CloseHandle(hStopEvent);
+        hStopEvent = NULL;
+    } if (sock != INVALID_SOCKET) {
         closesocket(sock);
+        sock = INVALID_SOCKET;
+    }
 }
 
 // if program exits prematurely
 double SenderSocket::Now() const {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void SenderSocket::UpdateRTO(double sampleRTT) {
+    if (estRTT == 0.0) {
+        estRTT = sampleRTT;
+        devRTT = sampleRTT / 2.0;
+    } else {
+        estRTT = 0.875 * estRTT + 0.125 * sampleRTT;
+        devRTT = 0.75 * devRTT + 0.25 * abs(sampleRTT - estRTT);
+    }
+
+    // prevent deviation from falling below 10ms
+    RTO = estRTT + 4.0 * max(devRTT, 0.010);
+}
+
+DWORD WINAPI SenderSocket::StatsThreadEntry(LPVOID param) {
+    SenderSocket* ss = (SenderSocket*)param;
+    ss->StatsWorker();
+    return 0;
+}
+
+void SenderSocket::StatsWorker() {
+    DWORD prevBase = 0;
+    auto prevTime = std::chrono::steady_clock::now();
+
+    // prints status every 2s
+    while (WaitForSingleObject(hStopEvent, 2000) == WAIT_TIMEOUT) {
+        auto curTime = std::chrono::steady_clock::now();
+        double dSec = std::chrono::duration<double>(curTime - prevTime).count();
+        double totSec = std::chrono::duration<double>(curTime - t0).count();
+
+        DWORD curBase = baseSeq.load();
+        DWORD curNext = nextSeq.load();
+        int timeouts = numTimeouts.load();
+        int fastRetx = numFastRetx.load();
+
+        int payloadSize = MAX_PKT_SIZE - sizeof(SenderDataHeader);
+        double deltaBytes = (double)(curBase - prevBase) * payloadSize;
+        double speedMbps = (dSec > 0) ? ((deltaBytes * 8.0) / (dSec * 1e6)) : 0.0;
+        double mbAcked = ((double)curBase * payloadSize) / (1024.0 * 1024.0);
+
+        printf("[%2d] B %5d (%4.1f MB) N %5d T %d F %d W %d S %6.3f Mbps RTT %.3f\n", (int)totSec, curBase, mbAcked, curNext, timeouts, fastRetx, effWnd, speedMbps, estRTT);
+
+        prevBase = curBase;
+        prevTime = curTime;
+    }
 }
 
 int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkProperties* lp) {
