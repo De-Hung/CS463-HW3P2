@@ -37,7 +37,7 @@ void SenderSocket::UpdateRTO(double sampleRTT) {
         devRTT = sampleRTT / 2.0;
     } else {
         estRTT = 0.875 * estRTT + 0.125 * sampleRTT;
-        devRTT = 0.75 * devRTT + 0.25 * abs(sampleRTT - estRTT);
+        devRTT = 0.75 * devRTT + 0.25 * fabs(sampleRTT - estRTT);
     }
 
     // prevent deviation from falling below 10ms
@@ -53,9 +53,13 @@ DWORD WINAPI SenderSocket::StatsThreadEntry(LPVOID param) {
 void SenderSocket::StatsWorker() {
     DWORD prevBase = 0;
     auto prevTime = std::chrono::steady_clock::now();
+    int tick = 1;
 
-    // prints status every 2s
-    while (WaitForSingleObject(hStopEvent, 2000) == WAIT_TIMEOUT) {
+    while (true) {
+        double wait = 2.0 * tick - Now();
+        DWORD ms = wait > 0 ? (DWORD)(wait * 1000) : 0;
+        if (WaitForSingleObject(hStopEvent, ms) != WAIT_TIMEOUT) break;
+        tick++;
         auto curTime = std::chrono::steady_clock::now();
         double dSec = std::chrono::duration<double>(curTime - prevTime).count();
         double totSec = std::chrono::duration<double>(curTime - t0).count();
@@ -131,9 +135,14 @@ int SenderSocket::Open(const char* targetHost, int port, int senderWindow, LinkP
         return status;
     }
 
-    // estimators from SYN sample RTT
-    estRTT = rttSample;
-    devRTT = 0.0;
+    if (rttSample > 0) {
+        estRTT = rttSample;
+        devRTT = 0.0;
+    } else {
+        estRTT = lp->RTT;
+        devRTT = 0.0;
+    }
+
     RTO = estRTT + 4.0 * max(devRTT, 0.010);
     effWnd = min(senderWnd, (int)rh.recvWnd);
 
@@ -154,20 +163,22 @@ int SenderSocket::Send(const char* buf, int bytes) {
     if (!connected) return NOT_CONNECTED;
 
     char pkt[MAX_PKT_SIZE];
+    memset(pkt, 0, sizeof(SenderDataHeader));
+
     SenderDataHeader* sdh = (SenderDataHeader*)pkt;
     sdh->flags.magic = MAGIC_PROTOCOL;
     sdh->flags.SYN = 0;
     sdh->flags.ACK = 0;
     sdh->flags.FIN = 0;
+    sdh->flags.reserved = 0;
     sdh->seq = nextSeq.load();
 
+    nextSeq++;
     memcpy(pkt + sizeof(SenderDataHeader), buf, bytes);
     int pktLen = (int)(sizeof(SenderDataHeader) + bytes);
 
     if (sdh->seq == 0) tFirstData = std::chrono::steady_clock::now();
-    nextSeq++;
 
-    // same as Open()
     ReceiverHeader rh;
     double rttSample = 0;
     int status = SendAndWait("data", sdh->seq, pkt, pktLen, OTHER_MAX_ATTEMPTS, false, false, rh, rttSample);
@@ -207,7 +218,7 @@ int SenderSocket::Close(double* elapsedTime) {
     if (status != STATUS_OK) return status;
 
     finalChecksum = rh.recvWnd;
-    printf("[%6.2f] <-- FIN-ACK %d window %X\n", Now(), rh.ackSeq, finalChecksum);
+    printf("[%5.2f] <-- FIN-ACK %d window %X\n", Now(), rh.ackSeq, finalChecksum);
 
     if (elapsedTime != nullptr) *elapsedTime = std::chrono::duration<double>(tLastData - tFirstData).count();
 
@@ -218,20 +229,14 @@ int SenderSocket::Close(double* elapsedTime) {
 }
 
 int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int len, int maxAttempts, bool isSYN, bool isFIN, ReceiverHeader& rh, double& rttSample) {
-    // records when attempt was sent
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
         auto sendTime = std::chrono::steady_clock::now();
         if (sendto(sock, pkt, len, 0, (struct sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) return FAILED_SEND;
-
         double deadline = Now() + RTO;
 
-        // wait for a matching reply until RTO expires
         while (true) {
             double remaining = deadline - Now();
-            if (remaining <= 0) {
-                numTimeouts++;
-                break;
-            }
+            if (remaining <= 0) break;
 
             fd_set fd;
             FD_ZERO(&fd);
@@ -242,37 +247,34 @@ int SenderSocket::SendAndWait(const char* name, DWORD seq, const char* pkt, int 
 
             int ready = select(0, &fd, NULL, NULL, &tv);
             if (ready == SOCKET_ERROR) return FAILED_RECV;
-            if (ready == 0) {
-                break;
+            if (ready == 0) break;
 
-                struct sockaddr_in from;
-                int fromLen = sizeof(from);
-                int bytes = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
+            struct sockaddr_in from;
+            int fromLen = sizeof(from);
+            int bytes = recvfrom(sock, (char*)&rh, sizeof(rh), 0, (struct sockaddr*)&from, &fromLen);
+            if (bytes == SOCKET_ERROR) return FAILED_RECV;
+            if (bytes != sizeof(ReceiverHeader)) continue;
+            if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
 
-                if (bytes == SOCKET_ERROR) return FAILED_RECV;
-                if (bytes != sizeof(ReceiverHeader)) continue;
-                if (rh.flags.magic != MAGIC_PROTOCOL || !rh.flags.ACK) continue;
-                if (isSYN) {
-                    if (rh.flags.SYN) {
+            if (isSYN) {
+                if (rh.flags.SYN) {
+                    if (attempt == 1)
                         rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
-                        return STATUS_OK;
+                    return STATUS_OK;
+                }
+            } else if (isFIN) {
+                if (rh.flags.FIN) return STATUS_OK;
+            } else {
+                if (rh.ackSeq == seq + 1) {
+                    if (attempt == 1) {   // Karn's rule: only sample non-retransmitted packets
+                        rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
+                        UpdateRTO(rttSample);
                     }
-                } else if (isFIN) {
-                    if (rh.flags.FIN) return STATUS_OK;
-                } else {
-                    // ACK checks for seq + 1
-                    if (rh.ackSeq == seq + 1) {
-                        // only update RTO on attempt 1
-                        if (attempt == 1) {
-                            rttSample = std::chrono::duration<double>(std::chrono::steady_clock::now() - sendTime).count();
-                            UpdateRTO(rttSample);
-                        }
-                        return STATUS_OK;
-                    }
+                    return STATUS_OK;
                 }
             }
-            numTimeouts++;
         }
-        return TIMEOUT;
+        if (!isSYN && !isFIN) numTimeouts++;
     }
+    return TIMEOUT;
 }
